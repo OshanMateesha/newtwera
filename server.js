@@ -5,7 +5,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 7860;
-const API_SECRET = "MY_SECRET_BOT_KEY_123";
+const API_SECRET = process.env.API_SECRET || "MY_SECRET_BOT_KEY_123";
 
 let globalBrowser = null;
 
