@@ -5,7 +5,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 7860;
-const API_SECRET = process.env.API_SECRET || "MY_SECRET_BOT_KEY_123";
+const API_SECRET = "MY_SECRET_BOT_KEY_123";
 
 let globalBrowser = null;
 
@@ -23,28 +23,6 @@ window.postMessage = function (msg, ...rest) {
 
 // Thumbnail / stream links අයින් කරන්න
 const SKIP_WORDS = ['.jpg', '.jpeg', '.gif', '.png', '.webp', 'thumb', 'avatar', 'favicon'];
-
-// ---------- DEBUG helpers ----------
-function makeDbg(debug) {
-  return (msg) => {
-    const line = `${new Date().toISOString().slice(11, 19)} ${msg}`;
-    debug.push(line);
-    console.log(`🔎 ${line}`);
-  };
-}
-
-function short(u) {
-  try {
-    const x = new URL(u);
-    return x.host + x.pathname.slice(0, 50);
-  } catch (e) {
-    return String(u).slice(0, 70);
-  }
-}
-
-function firstLine(msg) {
-  return String(msg || '').split('\n')[0].slice(0, 160);
-}
 
 async function getBrowser() {
   if (!globalBrowser || !globalBrowser.isConnected()) {
@@ -112,35 +90,14 @@ async function press(page, btn) {
 }
 
 // TeraBox web app එකෙන් download links (name + url + cookie) ගන්නවා. File එක ඩවුන්ලෝඩ් කරන්නේ නැහැ.
-async function extractTeraboxFiles(context, shareLink, webappUrl, debug) {
-  const dbg = makeDbg(debug);
+async function extractTeraboxFiles(context, shareLink, webappUrl) {
   const files = [];        // { name, url, cookie, referer, userAgent }
   const openedLinks = [];
   let downloadEvents = 0;
   let userAgent = '';
-  let noise = 0;           // debug logs වැඩිවෙන එක පාලනය කරන්න
-  const NOISE_LIMIT = 25;
-
-  dbg(`START share=${shareLink} webapp=${short(webappUrl)}`);
 
   await context.addInitScript(TG_HOOK_JS);
   const page = await context.newPage();
-
-  // ---- Debug: සියලුම page වල failed requests / 4xx 5xx responses / page errors ----
-  context.on('requestfailed', r => {
-    if (noise++ < NOISE_LIMIT) {
-      const f = r.failure();
-      dbg(`REQ FAILED ${short(r.url())} ${f ? f.errorText : ''}`);
-    }
-  });
-  context.on('response', r => {
-    if (r.status() >= 400 && noise++ < NOISE_LIMIT) {
-      dbg(`HTTP ${r.status()} ${short(r.url())}`);
-    }
-  });
-  page.on('pageerror', e => {
-    if (noise++ < NOISE_LIMIT) dbg(`PAGEERROR ${firstLine(e.message)}`);
-  });
 
   // Network / Web App Event Sniffing
   page.on('console', msg => {
@@ -148,13 +105,9 @@ async function extractTeraboxFiles(context, shareLink, webappUrl, debug) {
     if (!text.startsWith('TGEVENT ')) return;
     try {
       const event = JSON.parse(text.slice(8));
-      dbg(`TGEVENT ${event.eventType}`);
       if (['web_app_open_link', 'web_app_open_tg_link'].includes(event.eventType)) {
         const url = (event.eventData || {}).url;
-        if (url) {
-          openedLinks.push(url);
-          dbg(`openedLinks +1 -> ${short(url)}`);
-        }
+        if (url) openedLinks.push(url);
       }
     } catch (e) {}
   });
@@ -164,7 +117,6 @@ async function extractTeraboxFiles(context, shareLink, webappUrl, debug) {
   const onDownload = async (download) => {
     const name = download.suggestedFilename();
     const url = download.url();
-    dbg(`DOWNLOAD EVENT ${name} <- ${short(url)}`);
 
     if (!files.some(f => f.name === name)) {
       let cookie = '';
@@ -185,11 +137,9 @@ async function extractTeraboxFiles(context, shareLink, webappUrl, debug) {
   page.on('download', onDownload);
   context.on('page', pg => pg.on('download', onDownload));
   const helper = await context.newPage(); // download links open කරන්න එකම page එක
-  helper.on('download', onDownload);
 
   await page.goto(webappUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   userAgent = await page.evaluate(() => navigator.userAgent);
-  dbg(`web app loaded. UA=${userAgent.slice(0, 80)}`);
 
   const linkInput = page.locator('input[placeholder="Enter TeraBox link"]');
   await linkInput.waitFor({ timeout: 30000 });
@@ -200,16 +150,11 @@ async function extractTeraboxFiles(context, shareLink, webappUrl, debug) {
     page.locator('form button[type="submit"]').click()
   ]);
 
-  dbg(`API ${response.status()} ${short(response.url())}`);
-
   let apiData = null;
   try {
-    const raw = await response.text();
-    dbg(`API body (${raw.length} chars): ${raw.slice(0, 400)}`);
-    apiData = JSON.parse(raw);
+    apiData = await response.json();
   } catch (e) {
     console.log(`⚠️ [API] response read කරන්න බැරි: ${e.message}`);
-    dbg(`API parse fail: ${firstLine(e.message)}`);
   }
 
   let expected = 1;
@@ -220,7 +165,6 @@ async function extractTeraboxFiles(context, shareLink, webappUrl, debug) {
   const greenBtn = page.locator('button.bg-green-600', { hasText: 'Download' });
   try {
     await greenBtn.first().waitFor({ timeout: 180000 });
-    dbg(`green button visible, count=${await greenBtn.count()}`);
   } catch (e) {
     throw new Error('Green Download button එක ආවේ නැහැ');
   }
@@ -240,61 +184,38 @@ async function extractTeraboxFiles(context, shareLink, webappUrl, debug) {
   };
 
   // ---- Plan A: API download links ----
-  const links = apiData ? directLinks(apiData) : [];
-  dbg(`PLAN A: ${links.length} link(s) [${links.map(l => l.path).join(', ')}]`);
-
-  for (const { path, url } of links) {
-    if (files.length >= expected) break;
-    const beforeFiles = files.length;
-    const beforeEvents = downloadEvents;
-    dbg(`A -> goto ${path} ${short(url)}`);
-    try {
-      const resp = await helper.goto(url, { timeout: 30000 });
-      if (resp) {
-        const h = resp.headers();
-        dbg(`A status=${resp.status()} type=${h['content-type'] || '-'} disp=${(h['content-disposition'] || '-').slice(0, 60)}`);
-      }
-    } catch (e) {
-      dbg(`A goto err: ${firstLine(e.message)}`);
+  if (apiData) {
+    for (const { url } of directLinks(apiData)) {
+      if (files.length >= expected) break;
+      const beforeFiles = files.length;
+      const beforeEvents = downloadEvents;
+      try {
+        await helper.goto(url, { timeout: 30000 });
+      } catch (e) {}
+      await waitForNew(beforeEvents, 25000);
+      if (files.length === beforeFiles) await resetHelper();
     }
-    await waitForNew(beforeEvents, 25000);
-    dbg(`A result: files ${beforeFiles} -> ${files.length}`);
-    if (files.length === beforeFiles) await resetHelper();
   }
 
   // ---- Plan B: green buttons ----
   if (files.length < expected) {
-    dbg(`PLAN B start (files=${files.length}/${expected})`);
     for (let attempt = 1; attempt <= 3; attempt++) {
       const count = await greenBtn.count();
-      dbg(`B attempt ${attempt}: green buttons=${count}`);
       for (let i = 0; i < Math.max(count, 1); i++) {
         if (files.length >= expected) break;
 
         const beforeFiles = files.length;
         const beforeEvents = downloadEvents;
-        try {
-          await press(page, greenBtn.nth(Math.min(i, count - 1)));
-          dbg(`B pressed button #${i}`);
-        } catch (e) {
-          dbg(`B press err: ${firstLine(e.message)}`);
-        }
+        await press(page, greenBtn.nth(Math.min(i, count - 1)));
         await waitForNew(beforeEvents, 60000);
-        dbg(`B after press: files ${beforeFiles} -> ${files.length}, openedLinks=${openedLinks.length}`);
 
         if (files.length === beforeFiles && openedLinks.length) {
           const retryFiles = files.length;
           const retryEvents = downloadEvents;
-          const target = openedLinks.shift();
-          dbg(`B retry via openedLink ${short(target)}`);
           try {
-            const resp = await helper.goto(target, { timeout: 30000 });
-            if (resp) dbg(`B openedLink status=${resp.status()}`);
-          } catch (e) {
-            dbg(`B openedLink err: ${firstLine(e.message)}`);
-          }
+            await helper.goto(openedLinks.shift(), { timeout: 30000 });
+          } catch (e) {}
           await waitForNew(retryEvents, 60000);
-          dbg(`B openedLink result: files ${retryFiles} -> ${files.length}`);
           if (files.length === retryFiles) await resetHelper();
         }
 
@@ -308,7 +229,6 @@ async function extractTeraboxFiles(context, shareLink, webappUrl, debug) {
     }
   }
 
-  dbg(`DONE files=${files.length}/${expected} downloadEvents=${downloadEvents}`);
   return { files, expected };
 }
 
@@ -328,7 +248,6 @@ app.post('/api/automate', async (req, res) => {
     }
 
     let context = null;
-    const debug = [];
 
     try {
       const browser = await getBrowser();
@@ -338,7 +257,7 @@ app.post('/api/automate', async (req, res) => {
         viewport: { width: 480, height: 900 }
       });
 
-      const { files, expected } = await extractTeraboxFiles(context, shareLink, webappUrl, debug);
+      const { files, expected } = await extractTeraboxFiles(context, shareLink, webappUrl);
 
       await context.close();
       console.log(`🧹 [CLEANUP] Context closed successfully.`);
@@ -346,14 +265,13 @@ app.post('/api/automate', async (req, res) => {
       if (files.length) {
         return res.json({ success: true, data: { files, expected } });
       } else {
-        return res.json({ success: false, error: 'Download links not found', debug });
+        return res.json({ success: false, error: 'Download links not found' });
       }
 
     } catch (error) {
       if (context) await context.close().catch(() => {});
       console.log(`💥 [ERROR] ${error.message}`);
-      debug.push(`ERROR: ${firstLine(error.message)}`);
-      return res.status(500).json({ success: false, error: error.message, debug });
+      return res.status(500).json({ success: false, error: error.message });
     }
   }
 
